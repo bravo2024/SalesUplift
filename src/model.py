@@ -1,129 +1,163 @@
 from __future__ import annotations
+"""Uplift metalearners for heterogeneous treatment-effect estimation.
+
+Implements the two workhorse metalearners of Künzel et al. (2019):
+  * T-learner: fit mu1 on treated units and mu0 on control units separately,
+    then estimate CATE(x) = mu1(x) - mu0(x).
+  * S-learner: fit a single response model on [X, W], then estimate
+    CATE(x) = p(y=1 | x, W=1) - p(y=1 | x, W=0).
+
+Both use gradient-boosted trees (LightGBM when available, falling back to
+scikit-learn's GradientBoostingClassifier) as the base response estimator.
+Categorical covariates are one-hot encoded with a fitted encoder so train/test
+column alignment is guaranteed.
+"""
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import StratifiedKFold
-from src.core import build_models, compute_metrics, ks_statistic
+
+try:
+    import lightgbm as lgb
+    _HAS_LGB = True
+except Exception:  # pragma: no cover - fallback path
+    _HAS_LGB = False
+
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
 
 
-def train_all_models(data, seed=42, test_size=0.25):
-    X = data["X"].copy()
-    y = data["y"].values if hasattr(data["y"], "values") else data["y"].copy()
-    cat_cols = data.get("categorical_features", [])
-    for c in cat_cols:
-        if c in X.columns:
-            le = LabelEncoder()
-            X[c] = le.fit_transform(X[c].astype(str))
-    num_cols = data.get("numerical_features", [])
-    for c in num_cols:
-        if c in X.columns:
-            X[c] = X[c].fillna(X[c].median())
-    from sklearn.model_selection import train_test_split as _tts
-    X_train, X_test, y_train, y_test = _tts(
-        X, y, test_size=test_size, stratify=y, random_state=seed
+def _gbm(seed: int):
+    """Regularized gradient-boosted classifier (LightGBB if present else sklearn)."""
+    if _HAS_LGB:
+        return lgb.LGBMClassifier(
+            n_estimators=200, max_depth=4, num_leaves=15, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, min_child_samples=30,
+            reg_lambda=1.0, random_state=seed, n_jobs=1, verbose=-1,
+        )
+    return GradientBoostingClassifier(
+        n_estimators=200, max_depth=3, learning_rate=0.05, subsample=0.8,
+        min_samples_leaf=20, random_state=seed,
     )
-    scaler = StandardScaler()
-    num_cols_actual = [c for c in num_cols if c in X_train.columns]
-    X_train_scaled = X_train.copy()
-    X_test_scaled = X_test.copy()
-    if num_cols_actual:
-        X_train_scaled[num_cols_actual] = scaler.fit_transform(X_train[num_cols_actual])
-        X_test_scaled[num_cols_actual] = scaler.transform(X_test[num_cols_actual])
-    models = build_models(X_train_scaled, y_train, seed=seed)
-    results = {}
-    for name, model in models.items():
-        y_proba = model.predict_proba(X_test_scaled)[:, 1]
-        y_pred = (y_proba >= 0.5).astype(int)
-        metrics = compute_metrics(y_test, y_pred, y_proba)
-        metrics["ks"] = ks_statistic(y_test, y_proba)
-        results[name] = {"metrics": metrics, "y_proba": y_proba, "y_pred": y_pred}
+
+
+class FeatureEncoder:
+    """One-hot encode a fixed set of categorical columns; pass others through."""
+
+    def __init__(self, categorical_features):
+        self.cat = list(categorical_features)
+        self.columns_: list[str] = []
+
+    def _frame(self, X) -> pd.DataFrame:
+        Xc = X.copy()
+        for c in self.cat:
+            if c in Xc.columns:
+                Xc[c] = Xc[c].astype(str)
+        if self.cat:
+            return pd.get_dummies(Xc, columns=self.cat, drop_first=False)
+        return Xc
+
+    def fit(self, X):
+        self.columns_ = self._frame(X).columns.tolist()
+        return self
+
+    def transform(self, X) -> pd.DataFrame:
+        Xt = self._frame(X)
+        for c in self.columns_:
+            if c not in Xt.columns:
+                Xt[c] = 0
+        return Xt[self.columns_].astype(float)
+
+
+class TLearner:
+    """Two-model metalearner: CATE(x) = mu1(x) - mu0(x)."""
+
+    name = "T-learner"
+
+    def __init__(self, categorical_features, seed: int = 42):
+        self.cat = list(categorical_features)
+        self.encoder = FeatureEncoder(self.cat)
+        self.mu1 = _gbm(seed)
+        self.mu0 = _gbm(seed + 1)
+
+    def fit(self, X, y, treatment):
+        self.encoder.fit(X)
+        t = np.asarray(treatment)
+        ya = np.asarray(y, dtype=float)
+        Xe = self.encoder.transform(X)
+        self.mu1.fit(Xe[t == 1], ya[t == 1])
+        self.mu0.fit(Xe[t == 0], ya[t == 0])
+        return self
+
+    def predict_uplift(self, X) -> np.ndarray:
+        Xe = self.encoder.transform(X)
+        return self.mu1.predict_proba(Xe)[:, 1] - self.mu0.predict_proba(Xe)[:, 1]
+
+
+class SLearner:
+    """Single-model metalearner: CATE(x) = p(x,W=1) - p(x,W=0)."""
+
+    name = "S-learner"
+    _tcol = "__treatment__"
+
+    def __init__(self, categorical_features, seed: int = 42):
+        self.cat = list(categorical_features)
+        self.encoder = FeatureEncoder(self.cat)
+        self.model = _gbm(seed)
+
+    @staticmethod
+    def _augment(X, treatment) -> pd.DataFrame:
+        Xa = X.copy()
+        Xa[SLearner._tcol] = np.asarray(treatment, dtype=float)
+        return Xa
+
+    def fit(self, X, y, treatment):
+        Xa = self._augment(X, treatment)
+        self.encoder.fit(Xa)
+        Xe = self.encoder.transform(Xa)
+        self.model.fit(Xe, np.asarray(y, dtype=float))
+        return self
+
+    def predict_uplift(self, X) -> np.ndarray:
+        n = len(X)
+        p1 = self.model.predict_proba(self.encoder.transform(self._augment(X, np.ones(n))))[:, 1]
+        p0 = self.model.predict_proba(self.encoder.transform(self._augment(X, np.zeros(n))))[:, 1]
+        return p1 - p0
+
+
+def fit_uplift_models(data: dict, seed: int = 42, test_size: float = 0.25) -> dict:
+    """Fit T- and S-learners on a stratified train/test split (stratify by treatment
+    to keep the ~50/50 assignment in both folds)."""
+    X = data["X"]
+    y = np.asarray(data["y"], dtype=float)
+    w = np.asarray(data["treatment"], dtype=float)
+    cat = data.get("categorical_features", [])
+    true_tau = np.asarray(data["true_tau"], dtype=float)
+
+    idx = np.arange(len(y))
+    tr, te = train_test_split(idx, test_size=test_size, stratify=w, random_state=seed)
+    Xtr, Xte = X.iloc[tr], X.iloc[te]
+    ytr, yte, wtr, wte = y[tr], y[te], w[tr], w[te]
+
+    t_learner = TLearner(cat, seed=seed).fit(Xtr, ytr, wtr)
+    s_learner = SLearner(cat, seed=seed).fit(Xtr, ytr, wtr)
+
+    models = {"T-learner": t_learner, "S-learner": s_learner}
+    uplift_test = {name: predict_uplift(m, Xte) for name, m in models.items()}
+    uplift_train = {name: predict_uplift(m, Xtr) for name, m in models.items()}
+
     return {
         "models": models,
-        "results": results,
-        "scaler": scaler,
-        "X_train": X_train_scaled,
-        "X_test": X_test_scaled,
-        "y_train": y_train,
-        "y_test": y_test,
+        "X_train": Xtr, "X_test": Xte,
+        "y_train": ytr, "y_test": yte,
+        "treatment_train": wtr, "treatment_test": wte,
+        "true_tau_test": true_tau[te],
+        "uplift_test": uplift_test,
+        "uplift_train": uplift_train,
+        "n_train": int(len(tr)), "n_test": int(len(te)),
+        "categorical_features": list(cat),
         "features": list(X.columns),
-        "n_train": len(y_train),
-        "n_test": len(y_test),
     }
 
 
-def cross_validate(data, seed=42, n_folds=5):
-    X = data["X"].copy()
-    y = data["y"].values if hasattr(data["y"], "values") else data["y"].copy()
-    cat_cols = data.get("categorical_features", [])
-    for c in cat_cols:
-        if c in X.columns:
-            le = LabelEncoder()
-            X[c] = le.fit_transform(X[c].astype(str))
-    num_cols = data.get("numerical_features", [])
-    for c in num_cols:
-        if c in X.columns:
-            X[c] = X[c].fillna(X[c].median())
-    num_cols_actual = [c for c in num_cols if c in X.columns]
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    cv_results = {name: {"roc_auc": [], "gini": [], "ks": [], "f1": []}
-                  for name in ["Logistic Regression", "Random Forest", "Gradient Boosting", "XGBoost"]}
-    for train_idx, test_idx in skf.split(X, y):
-        X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
-        y_tr, y_te = y[train_idx], y[test_idx]
-        scaler = StandardScaler()
-        if num_cols_actual:
-            X_tr_scaled = X_tr.copy()
-            X_te_scaled = X_te.copy()
-            X_tr_scaled[num_cols_actual] = scaler.fit_transform(X_tr[num_cols_actual])
-            X_te_scaled[num_cols_actual] = scaler.transform(X_te[num_cols_actual])
-        else:
-            X_tr_scaled, X_te_scaled = X_tr, X_te
-        models = build_models(X_tr_scaled, y_tr, seed=seed)
-        for name, model in models.items():
-            y_proba = model.predict_proba(X_te_scaled)[:, 1]
-            y_pred = (y_proba >= 0.5).astype(int)
-            met = compute_metrics(y_te, y_pred, y_proba)
-            cv_results[name]["roc_auc"].append(met.get("roc_auc", 0))
-            cv_results[name]["gini"].append(met.get("gini", 0))
-            cv_results[name]["ks"].append(ks_statistic(y_te, y_proba))
-            cv_results[name]["f1"].append(met.get("f1", 0))
-    summary = {}
-    for name, scores in cv_results.items():
-        summary[name] = {}
-        for metric, vals in scores.items():
-            summary[name][metric] = {
-                "mean": float(np.mean(vals)),
-                "std": float(np.std(vals)),
-                "values": [float(v) for v in vals],
-            }
-    return summary
-
-
-def permutation_importance(model, X_val, y_val, metric_fn, n_repeats=10, seed=42):
-    rng = np.random.default_rng(seed)
-    baseline = metric_fn(y_val, model.predict_proba(X_val)[:, 1])
-    importances = []
-    for col_idx in range(X_val.shape[1]):
-        scores = []
-        for _ in range(n_repeats):
-            X_perm = X_val.copy()
-            X_perm[:, col_idx] = rng.permutation(X_perm[:, col_idx])
-            score = metric_fn(y_val, model.predict_proba(X_perm)[:, 1])
-            scores.append(baseline - score)
-        importances.append({
-            "mean": float(np.mean(scores)),
-            "std": float(np.std(scores)),
-        })
-    return importances
-
-
-def threshold_sweep(y_true, y_proba):
-    thresholds = np.linspace(0.05, 0.95, 91)
-    rows = []
-    for tau in thresholds:
-        y_pred = (y_proba >= tau).astype(int)
-        met = compute_metrics(y_true, y_pred, y_proba)
-        met["threshold"] = float(tau)
-        met["accept_rate"] = float((y_pred == 0).mean())
-        rows.append(met)
-    return pd.DataFrame(rows)
+def predict_uplift(model, X) -> np.ndarray:
+    """Predict CATE (uplift) for arbitrary feature rows."""
+    return np.asarray(model.predict_uplift(X), dtype=float)
