@@ -64,7 +64,8 @@ def qini_curve(y, treatment, uplift, n_points: int = 100):
 def random_qini_curve(y, treatment, n_points: int = 100):
     """Straight-line baseline Qini: linear from (0,0) to (1, qini_total)."""
     total = qini_total(y, treatment)
-    frac = np.linspace(0, 1, n_points)
+    # n_points + 1 so it lines up with qini_curve, which prepends the origin
+    frac = np.linspace(0, 1, n_points + 1)
     return frac, frac * total
 
 

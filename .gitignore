@@ -13,3 +13,4 @@ models/metrics.json
 models/*.png
 .pytest_cache/
 .DS_Store
+data/*.csv

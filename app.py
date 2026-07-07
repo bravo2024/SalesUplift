@@ -16,7 +16,7 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-from src.data import make_synthetic
+from src.data import load_hillstrom, make_synthetic
 from src.model import fit_uplift_models
 from src.evaluate import uplift_report, qini_curves_for_plot
 from src.core import uplift_at_k
@@ -32,14 +32,18 @@ plt.rcParams.update({
 COLORS = {"T-learner": "#22d3ee", "S-learner": "#a78bfa", "random": "#64748b"}
 
 
-@st.cache_data(show_spinner="Generating synthetic campaign data…")
-def get_data(n: int, seed: int):
+def _load(dataset: str, n: int, seed: int):
+    if dataset.startswith("Hillstrom"):
+        try:
+            return load_hillstrom()
+        except Exception:
+            st.sidebar.warning("Hillstrom download failed — using synthetic data.")
     return make_synthetic(n=n, seed=seed)
 
 
 @st.cache_data(show_spinner="Training uplift metalearners…")
-def get_fit(n: int, seed: int, test_size: float):
-    data = make_synthetic(n=n, seed=seed)
+def get_fit(dataset: str, n: int, seed: int, test_size: float):
+    data = _load(dataset, n, seed)
     fit = fit_uplift_models(data, seed=seed, test_size=test_size)
     report = uplift_report(fit)
     curves = qini_curves_for_plot(fit)
@@ -48,17 +52,18 @@ def get_fit(n: int, seed: int, test_size: float):
 
 with st.sidebar:
     st.header("⚙️ Experiment Controls")
-    n = st.slider("Customers (sample size)", 2000, 40000, 12000, 1000)
+    dataset = st.radio("Dataset", ["Hillstrom e-mail (real, 64k)", "Synthetic campaign"])
+    n = st.slider("Customers (synthetic only)", 2000, 40000, 12000, 1000)
     seed = st.number_input("Random seed", 0, 999, 42)
     test_size = st.slider("Holdout fraction", 0.15, 0.40, 0.25, 0.05)
     k = st.slider("Targeting depth k (uplift@k)", 0.05, 0.60, 0.30, 0.05)
     st.caption("Causal ML · Uplift Modeling")
 
-st.title("📈 SalesUplift — Heterogeneous Treatment-Effect Platform")
+st.title("📈 SalesUplift — Campaign Uplift Modeling")
 st.markdown("Estimate **CATE** with T-learner & S-learner metalearners and rank customers "
             "by persuadability using **Qini / AUUC** curves.")
 
-fit, report, curves, data = get_fit(int(n), int(seed), float(test_size))
+fit, report, curves, data = get_fit(dataset, int(n), int(seed), float(test_size))
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Customers", f"{data['n_samples']:,}")
@@ -99,7 +104,7 @@ with tab_m:
         rows.append({"Metalearner": name, **{k: round(v, 4) for k, v in m.items()}})
     st.dataframe(pd.DataFrame(rows).set_index("Metalearner"), use_container_width=True)
     st.caption("Qini coefficient > 0 ⇒ uplift model beats random targeting. "
-               "Spearman vs true τ measures CATE-ranking recovery.")
+               "Spearman vs true τ (synthetic only) measures CATE-ranking recovery.")
 
 with tab_d:
     col_a, col_b = st.columns(2)

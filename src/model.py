@@ -130,7 +130,9 @@ def fit_uplift_models(data: dict, seed: int = 42, test_size: float = 0.25) -> di
     y = np.asarray(data["y"], dtype=float)
     w = np.asarray(data["treatment"], dtype=float)
     cat = data.get("categorical_features", [])
-    true_tau = np.asarray(data["true_tau"], dtype=float)
+    true_tau = data.get("true_tau")
+    if true_tau is not None:
+        true_tau = np.asarray(true_tau, dtype=float)
 
     idx = np.arange(len(y))
     tr, te = train_test_split(idx, test_size=test_size, stratify=w, random_state=seed)
@@ -149,7 +151,7 @@ def fit_uplift_models(data: dict, seed: int = 42, test_size: float = 0.25) -> di
         "X_train": Xtr, "X_test": Xte,
         "y_train": ytr, "y_test": yte,
         "treatment_train": wtr, "treatment_test": wte,
-        "true_tau_test": true_tau[te],
+        "true_tau_test": true_tau[te] if true_tau is not None else None,
         "uplift_test": uplift_test,
         "uplift_train": uplift_train,
         "n_train": int(len(tr)), "n_test": int(len(te)),

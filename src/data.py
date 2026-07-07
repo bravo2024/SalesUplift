@@ -111,3 +111,48 @@ def make_synthetic(n: int = 10000, seed: int = 42) -> dict:
         "treatment_rate": float(w.mean()),
         "ate": ate,
     }
+
+
+HILLSTROM_URL = ("http://www.minethatdata.com/"
+                 "Kevin_Hillstrom_MineThatData_E-MailAnalytics_DataMiningChallenge_2008.03.20.csv")
+
+
+def load_hillstrom(cache_dir: str | None = None) -> dict:
+    """Hillstrom e-mail experiment, purchase conversion as the outcome.
+
+    64k customers, randomized e-mail vs holdout. Conversion (an actual
+    purchase within two weeks) is rare (~0.9%), which makes this a much
+    harder uplift target than site visits. No oracle CATE on real data,
+    so `true_tau` is None.
+    """
+    from pathlib import Path
+
+    cache = Path(cache_dir or Path(__file__).parent.parent / "data") / "hillstrom.csv"
+    if cache.exists():
+        raw = pd.read_csv(cache)
+    else:
+        raw = pd.read_csv(HILLSTROM_URL)
+        cache.parent.mkdir(exist_ok=True)
+        raw.to_csv(cache, index=False)
+
+    w = (raw["segment"] != "No E-Mail").astype(int).to_numpy()
+    y = raw["conversion"].astype(float).to_numpy()
+
+    features = ["recency", "history", "mens", "womens", "newbie", "zip_code", "channel"]
+    categorical = ["zip_code", "channel"]
+
+    df = raw[features].copy()
+    df["treatment"] = w
+    df["conversion"] = y
+
+    treated = w == 1
+    ate = float(y[treated].mean() - y[~treated].mean())
+    return {
+        "X": raw[features].copy(), "y": y, "treatment": w.astype(float),
+        "true_tau": None, "df": df, "features": features,
+        "categorical_features": categorical,
+        "numerical_features": [f for f in features if f not in categorical],
+        "treatment_col": "treatment", "target_name": "conversion",
+        "n_samples": int(len(df)), "positive_rate": float(y.mean()),
+        "treatment_rate": float(w.mean()), "ate": ate,
+    }

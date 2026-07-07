@@ -9,6 +9,21 @@ single "conversion probability" to predict; the target is the *incremental* effe
 treatment, which is never observed for any individual (the fundamental problem of
 causal inference).
 
+## Data and results
+
+Default dataset is the real **Hillstrom e-mail experiment** (64k customers, randomized
+send vs holdout; downloaded once, cached in `data/`), with **purchase conversion** as the
+outcome — deliberately the hard version of the problem: conversions are rare (~0.9%), so
+uplift signal is thin and noisy.
+
+Held-out results: observed ATE **+0.48pp** conversion; T- and S-learner both rank
+usefully — uplift@10% ≈ **+0.6pp** (roughly 2× the average effect concentrated in the
+top decile), Qini coefficient > 0 for both. Numbers regenerate with `python train.py`.
+
+A synthetic generator with a known heterogeneous τ(x) is kept for estimator validation
+(`--synthetic`, or the sidebar toggle) — only simulated data can score CATE ranking
+against the true effect.
+
 ## Methodology
 
 ### Potential-outcomes data model

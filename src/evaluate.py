@@ -18,18 +18,17 @@ def uplift_report(fit_result: dict, ks=(0.1, 0.2, 0.3)) -> dict:
     ttau = fit_result["true_tau_test"]
     per_model = {}
     for name, up in fit_result["uplift_test"].items():
-        rho = spearmanr(up, ttau).correlation if len(ttau) > 2 else 0.0
-        if not np.isfinite(rho):
-            rho = 0.0
         per_model[name] = {
             "qini_coefficient": qini_coefficient(yte, wte, up),
             "auuc": auuc(yte, wte, up),
             **{f"uplift_at_{int(kk * 100)}pct": uplift_at_k(yte, wte, up, k=kk) for kk in ks},
             "expected_response_lift_30pct": expected_response_lift(yte, wte, up, k=0.3),
-            "spearman_vs_true_tau": float(rho),
             "cate_mean": float(np.mean(up)),
             "cate_std": float(np.std(up)),
         }
+        if ttau is not None:  # oracle effect only exists for synthetic data
+            rho = spearmanr(up, ttau).correlation if len(ttau) > 2 else 0.0
+            per_model[name]["spearman_vs_true_tau"] = float(rho) if np.isfinite(rho) else 0.0
     return {"per_model": per_model, "ate_observed": average_treatment_effect(yte, wte)}
 
 
